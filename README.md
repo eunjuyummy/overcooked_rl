@@ -110,9 +110,10 @@ bash eval_overcooked_mep_vs_proxy.sh
 
 ## Cite
 ### Data
+```bash
 overcooked_rl/mapbt/envs/overcooked/overcooked_berkeley/src/overcooked_ai_py
 https://drive.google.com/drive/folders/1qP7q7iHXyZF-eUMxzh-lbHf68nsgyABj?usp=sharing
-
+```
 
 ## Reference
 
