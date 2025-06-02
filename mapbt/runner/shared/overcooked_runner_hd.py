@@ -175,7 +175,7 @@ class OvercookedRunner(Runner):
             torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor_periodic_{}.pt".format(step))
             policy_critic = self.trainer.policy.critic
             torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic_periodic_{}.pt".format(step))
-    
+    '''
     @torch.no_grad()
     def eval(self, total_num_steps):
         eval_env_infos = defaultdict(list)
@@ -215,6 +215,73 @@ class OvercookedRunner(Runner):
         eval_env_infos['eval_average_episode_rewards'] = np.sum(eval_average_episode_rewards, axis=0)
         print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
         
+        self.log_env(eval_env_infos, total_num_steps)
+    '''
+
+    @torch.no_grad()
+    def eval(self, total_num_steps):
+        import imageio
+        from PIL import Image
+
+        eval_env_infos = defaultdict(list)
+        eval_average_episode_rewards = []
+        frames = []  # 프레임 저장용 리스트
+
+        eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
+        eval_obs = np.stack(eval_obs)
+
+        eval_rnn_states = np.zeros(
+            (self.n_eval_rollout_threads, *self.buffer.rnn_states.shape[2:]), dtype=np.float32
+        )
+        eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
+
+        for eval_step in range(self.episode_length):
+            self.trainer.prep_rollout()
+            eval_action, eval_rnn_states = self.trainer.policy.act(
+                np.concatenate(eval_obs),
+                np.concatenate(eval_rnn_states),
+                np.concatenate(eval_masks),
+                deterministic=not self.all_args.eval_stochastic
+            )
+            eval_actions = np.array(np.split(_t2n(eval_action), self.n_eval_rollout_threads))
+            eval_rnn_states = np.array(np.split(_t2n(eval_rnn_states), self.n_eval_rollout_threads))
+
+            # === 환경 step ===
+            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(eval_actions)
+            eval_obs = np.stack(eval_obs)
+            eval_average_episode_rewards.append(eval_rewards)
+
+            # === 비디오 프레임 저장 ===
+            # 한 환경만 렌더링 (0번 환경)
+            frame = self.eval_envs.render(mode="rgb_array")[0]  # 하나의 rollout thread만 저장
+            frames.append(Image.fromarray(frame))
+
+            # === done 처리 ===
+            eval_rnn_states[eval_dones == True] = np.zeros(
+                ((eval_dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32
+            )
+            eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
+            eval_masks[eval_dones == True] = np.zeros(((eval_dones == True).sum(), 1), dtype=np.float32)
+
+            # === 에피소드 정보 저장 ===
+            for eval_info in eval_infos:
+                eval_env_infos['eval_ep_sparse_r_by_agent0'].append(eval_info['episode']['ep_sparse_r_by_agent'][0])
+                eval_env_infos['eval_ep_sparse_r_by_agent1'].append(eval_info['episode']['ep_sparse_r_by_agent'][1])
+                eval_env_infos['eval_ep_shaped_r_by_agent0'].append(eval_info['episode']['ep_shaped_r_by_agent'][0])
+                eval_env_infos['eval_ep_shaped_r_by_agent1'].append(eval_info['episode']['ep_shaped_r_by_agent'][1])
+                eval_env_infos['eval_ep_sparse_r'].append(eval_info['episode']['ep_sparse_r'])
+                eval_env_infos['eval_ep_shaped_r'].append(eval_info['episode']['ep_shaped_r'])
+
+        eval_env_infos['eval_average_episode_rewards'] = np.sum(eval_average_episode_rewards, axis=0)
+        print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
+
+        # === 비디오 저장 ===
+        video_path = f"eval_episode_{total_num_steps}.mp4"
+        imageio.mimsave(video_path, frames, fps=10)
+        print(f"Saved evaluation video to {video_path}")
+        wandb.log({f"eval/video_{total_num_steps}": wandb.Video(video_path, fps=10, format="mp4")}, step=total_num_steps)
+        
+        # === 로깅 ===
         self.log_env(eval_env_infos, total_num_steps)
 
     @torch.no_grad()
