@@ -279,8 +279,8 @@ class OvercookedRunner(Runner):
         video_path = f"eval_episode_{total_num_steps}.mp4"
         imageio.mimsave(video_path, frames, fps=10)
         print(f"Saved evaluation video to {video_path}")
-        wandb.log({f"eval/video_{total_num_steps}": wandb.Video(video_path, fps=10, format="mp4")}, step=total_num_steps)
-        
+        #wandb.log({f"eval/video_{total_num_steps}": wandb.Video(video_path, fps=10, format="mp4")}, step=total_num_steps)
+        eval_env_infos['eval_video_path'] = video_path
         # === 로깅 ===
         self.log_env(eval_env_infos, total_num_steps)
 
