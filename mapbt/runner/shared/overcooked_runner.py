@@ -6,6 +6,7 @@ import numpy as np
 import itertools
 from itertools import chain
 import torch
+import torch.nn as nn
 import imageio
 import warnings
 import functools
@@ -22,6 +23,79 @@ from scipy.stats import rankdata
 def _t2n(x):
     return x.detach().cpu().numpy()
 
+class Model(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_size):
+        super(Model, self).__init__()
+        self.activation = torch.relu
+        self.affine_layers = nn.ModuleList()
+        last_dim = state_dim
+        for nh in hidden_size:
+            layer = nn.Linear(last_dim, nh)
+            nn.init.xavier_uniform_(layer.weight)
+            self.affine_layers.append(layer)
+            last_dim = nh
+
+        self.action_mean = nn.Linear(last_dim, action_dim)
+
+    def forward(self, x):
+        for affine in self.affine_layers:
+            x = self.activation(affine(x))
+        action_mean = self.action_mean(x)
+        return action_mean
+    
+class Ensemble(nn.Module):
+    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=2):
+        super(Ensemble, self).__init__()
+        
+        obs_dim = observation_shape[0]
+        act_dim = action_shape[0]
+        self.device = device
+        self.num_nets = num_nets
+
+        self.pis = []
+        for _ in range(num_nets):
+            pi = Model(obs_dim, act_dim, hidden_sizes).to(device).float()
+            self.pis.append(pi)
+
+    def act(self, obs, i=-1):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if i >= 0:  # optionally, only use one of the nets.
+                return self.pis[i](obs).cpu().numpy()
+            vals = list()
+            for pi in self.pis:
+                vals.append(pi(obs).cpu().numpy())
+            return np.mean(np.array(vals), axis=0)
+
+    def variance(self, obs):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            vals = list()
+            for pi in self.pis:
+                vals.append(pi(obs).cpu().numpy())
+            return np.square(np.std(np.array(vals), axis=0)).mean()
+
+    def load(self, path):
+        state = torch.load(path)
+        for net_id, net_state in state.items():
+            self.pis[int(net_id[-1])].load_state_dict(net_state)
+
+    def save(self, path):
+        state = {"ensemble_net_{}".format(i): self.pis[i].state_dict() for i in range(len(self.pis))}
+        torch.save(state, path)
+        
+class EnsembleDAgger:
+    def __init__(self, ensemble_model: Ensemble, threshold: float = 0.03):
+        self.ensemble = ensemble_model
+        self.threshold = threshold
+
+    def query_expert(self, obs):
+        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
+        
+        var = self.ensemble.variance(obs_np)
+
+        return var > self.threshold
+
 class OvercookedRunner(Runner):
     """
     A wrapper to start the RL agent training algorithm.
@@ -29,14 +103,64 @@ class OvercookedRunner(Runner):
     def __init__(self, config):
         super(OvercookedRunner, self).__init__(config)
         
-        
     def run(self):
-        self.warmup()   
+        self.warmup()
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
+        print(episodes)
         total_num_steps = 0
-
+        
+        # Ensemble 객체 생성
+        dummy_obs_list, dummy_share_obs_list, *_ = self.envs.step(np.zeros((self.n_rollout_threads, 2, 1), dtype=np.int32))
+        dummy_share_obs = np.array(dummy_share_obs_list[0])
+        _, h, w, c = dummy_share_obs.shape
+        feature_dim = h * w * c
+        self.obs_shape = (feature_dim,)
+        
+        self.action_dim = self.envs.action_space[0].n
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        ensemble_model = Ensemble(
+            observation_shape=self.obs_shape,
+            action_shape=(self.action_dim,),
+            device=device,
+            hidden_sizes=(256, 256),
+            num_nets=2
+        )
+        
+        dagger = EnsembleDAgger(ensemble_model, threshold=134.1)
+        
+        invention_num = list(range(10))
+        
+        # all_vars = []
+        # debug_steps = 500
+        
+        # for _ in range(debug_steps):
+        #     rand_actions = np.zeros((self.n_rollout_threads, 2, 1), dtype=np.int32)
+        #     _, share_obs_list, _, _, _, _ = self.envs.step(rand_actions)
+        #     share_obs = np.stack(share_obs_list)
+            
+        #     primary_agent_idx = 0
+        #     for env_id in range(self.n_rollout_threads):
+        #         single_share = share_obs[env_id, primary_agent_idx].reshape(-1)
+        #         var = dagger.ensemble.variance(single_share)
+        #         all_vars.append(var)
+        
+        # arr = np.array(all_vars)
+        # p75 = np.percentile(arr, 75)
+        # p90 = np.percentile(arr, 90)
+        # p95 = np.percentile(arr, 95)
+        # print("=== Ensemble 분산 분포 통계 ===")
+        # print("  최소값      :", np.min(arr))
+        # print("  제1사분위값 :", np.percentile(arr, 25))
+        # print("  중앙값      :", np.median(arr))
+        # print("  제3사분위값 :", p75)
+        # print("  최대값      :", np.max(arr))
+        # print("75% 분위수:", p75)
+        # print("90% 분위수:", p90, "95% 분위수:", p95)
+        
         for episode in range(episodes): 
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
@@ -47,11 +171,52 @@ class OvercookedRunner(Runner):
                     
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+                
                 obs = np.stack(obs)
-                total_num_steps += (self.n_rollout_threads)
-                self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
-                data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
-
+                share_obs = np.stack(share_obs)
+                
+                primary_agent_idx = 0
+                query_mask = []
+                for env_id in range(self.n_rollout_threads):
+                    single_share = share_obs[env_id, primary_agent_idx]
+                    obs_for_expert = single_share.reshape(-1)
+                    query_mask.append(dagger.query_expert(obs_for_expert))
+                
+                #query_mask = [dagger.query_expert(obs_i) for obs_i in obs]
+                
+                for env_id in invention_num:
+                    if query_mask[env_id]:
+                        available = available_actions[env_id][0]
+                        valid_actions = [i for i, avail in enumerate(available) if avail == 1]
+                        
+                        print(f"[Human intervention] Env {env_id}: available_actions = {valid_actions}")
+                        
+                        try:
+                            human_action = int(input(f"Env {env_id} 에서 선택할 action을 {valid_actions} 중 하나로 입력하세요: "))
+                            if human_action in valid_actions:
+                                actions[env_id, 0, 0] = human_action
+                            else:
+                                print("error! wrong action")
+                        except:
+                            print("error! wrong action")
+                            
+                    # 조건을 충족하면 인간이 개입 (인간의 개입) 현재 상태에서 할 수 있는
+                    # 다른 action 6개 중 1개 선택
+                    # terminal 에서 인간 한테 숫자 1-6 중 하나로 action 받기 	             
+                    # action = human action
+                    if any(query_mask[env_id] for env_id in invention_num):
+                        obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+                        obs = np.stack(obs)
+                        share_obs = np.stack(share_obs)
+                        total_num_steps += (self.n_rollout_threads)
+                        self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
+                        data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
+                        
+                    else:
+                        total_num_steps += (self.n_rollout_threads)
+                        self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
+                        data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
+                        
                 # insert data into buffer
                 self.insert(data)
 
