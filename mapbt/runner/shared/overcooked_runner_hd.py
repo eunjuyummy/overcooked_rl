@@ -6,6 +6,7 @@ import numpy as np
 import itertools
 from itertools import chain
 import torch
+import torch.nn as nn
 import imageio
 import warnings
 import functools
@@ -19,8 +20,84 @@ from typing import Dict
 from icecream import ic
 from scipy.stats import rankdata
 
+from rich.console import Console
+from rich.table import Table
+from rich.prompt import IntPrompt
+
 def _t2n(x):
     return x.detach().cpu().numpy()
+
+class Model(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_size):
+        super(Model, self).__init__()
+        self.activation = torch.relu
+        self.affine_layers = nn.ModuleList()
+        last_dim = state_dim
+        for nh in hidden_size:
+            layer = nn.Linear(last_dim, nh)
+            nn.init.xavier_uniform_(layer.weight)
+            self.affine_layers.append(layer)
+            last_dim = nh
+
+        self.action_mean = nn.Linear(last_dim, action_dim)
+
+    def forward(self, x):
+        for affine in self.affine_layers:
+            x = self.activation(affine(x))
+        action_mean = self.action_mean(x)
+        return action_mean
+    
+class Ensemble(nn.Module):
+    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=2):
+        super(Ensemble, self).__init__()
+        
+        obs_dim = observation_shape[0]
+        act_dim = action_shape[0]
+        self.device = device
+        self.num_nets = num_nets
+
+        self.pis = []
+        for _ in range(num_nets):
+            pi = Model(obs_dim, act_dim, hidden_sizes).to(device).float()
+            self.pis.append(pi)
+
+    def act(self, obs, i=-1):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if i >= 0:  # optionally, only use one of the nets.
+                return self.pis[i](obs).cpu().numpy()
+            vals = list()
+            for pi in self.pis:
+                vals.append(pi(obs).cpu().numpy())
+            return np.mean(np.array(vals), axis=0)
+
+    def variance(self, obs):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            vals = list()
+            for pi in self.pis:
+                vals.append(pi(obs).cpu().numpy())
+            return np.square(np.std(np.array(vals), axis=0)).mean()
+
+    def load(self, path):
+        state = torch.load(path)
+        for net_id, net_state in state.items():
+            self.pis[int(net_id[-1])].load_state_dict(net_state)
+
+    def save(self, path):
+        state = {"ensemble_net_{}".format(i): self.pis[i].state_dict() for i in range(len(self.pis))}
+        torch.save(state, path)
+        
+class EnsembleDAgger:
+    def __init__(self, ensemble_model: Ensemble, threshold: float = 0.03):
+        self.ensemble = ensemble_model
+        self.threshold = threshold
+
+    def query_expert(self, obs):
+        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
+        var = self.ensemble.variance(obs_np)
+        print(var)
+        return var > self.threshold
 
 class OvercookedRunner(Runner):
     """
@@ -31,21 +108,87 @@ class OvercookedRunner(Runner):
         
         
     def run(self):
-        self.warmup()
+        self.warmup()   
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
         total_num_steps = 0
 
+        ensemble_model = self.create_ensemble_model()
+        dagger = EnsembleDAgger(ensemble_model, threshold=10.0)
+
+        console = Console()
+        action_labels = {
+            0: "Stay",
+            1: "Up",
+            2: "Down",
+            3: "Left",
+            4: "Right",
+            5: "Interact"
+        }
+
         for episode in range(episodes): 
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
-            for step in range(self.episode_length): # episode_length is 400
+
+            for step in range(self.episode_length):
+                
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
+                    
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
                 obs = np.stack(obs)
+
+                if episode > episodes // 2:
+                    primary_agent_idx = 0
+                    query_mask = []
+
+                    for env_id in range(self.n_rollout_threads):
+                        single_share = share_obs[env_id, primary_agent_idx]
+                        obs_for_expert = single_share.reshape(-1)
+                        query_mask.append(dagger.query_expert(obs_for_expert))
+                    
+                    intervened_envs = [env_id for env_id, mask in enumerate(query_mask) if mask][:10]
+
+                    for env_id in intervened_envs:
+
+                        console.rule(f"[bold yellow]Episode {episode} – Environment {env_id} State")
+                        single_share = share_obs[env_id, primary_agent_idx]
+                        self.env_grid(single_share)
+
+                        available = available_actions[env_id][0]
+                        valid_actions = [i for i, avail in enumerate(available) if avail == 1]
+                        
+                        # Show valid actions in a table
+                        table = Table(title=f"Available Actions for Env {env_id}", show_lines=True)
+                        table.add_column("Index", justify="center", style="cyan")
+                        table.add_column("Action", justify="left", style="magenta")
+
+                        for action in valid_actions:
+                            label = action_labels.get(action, "Unknown")
+                            table.add_row(str(action), label)
+                        console.print(table)
+
+                        # Prompt user for action
+                        try:
+                            human_action = IntPrompt.ask(
+                                f"[bold green]Select an action for Env {env_id}"
+                            )
+                            if human_action in valid_actions:
+                                actions[env_id, 0, 0] = human_action
+                                console.print(
+                                    f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})",
+                                    style="bold green"
+                                )
+                            else:
+                                console.print(
+                                    f"[red]✘ Error: {human_action} is not in {valid_actions}",
+                                    style="bold red"
+                                )
+                        except Exception:
+                            console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
+
                 total_num_steps += (self.n_rollout_threads)
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
                 data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
@@ -91,12 +234,13 @@ class OvercookedRunner(Runner):
                 env_infos = defaultdict(list)
                 if self.env_name == "Overcooked":
                     for info in infos:
-                        env_infos['ep_sparse_r_by_agent0'].append(info['episode']['ep_sparse_r_by_agent'][0])
-                        env_infos['ep_sparse_r_by_agent1'].append(info['episode']['ep_sparse_r_by_agent'][1])
-                        env_infos['ep_shaped_r_by_agent0'].append(info['episode']['ep_shaped_r_by_agent'][0])
-                        env_infos['ep_shaped_r_by_agent1'].append(info['episode']['ep_shaped_r_by_agent'][1])
-                        env_infos['ep_sparse_r'].append(info['episode']['ep_sparse_r'])
-                        env_infos['ep_shaped_r'].append(info['episode']['ep_shaped_r'])
+                        if 'episode' in info:
+                            env_infos['ep_sparse_r_by_agent0'].append(info['episode']['ep_sparse_r_by_agent'][0])
+                            env_infos['ep_sparse_r_by_agent1'].append(info['episode']['ep_sparse_r_by_agent'][1])
+                            env_infos['ep_shaped_r_by_agent0'].append(info['episode']['ep_shaped_r_by_agent'][0])
+                            env_infos['ep_shaped_r_by_agent1'].append(info['episode']['ep_shaped_r_by_agent'][1])
+                            env_infos['ep_sparse_r'].append(info['episode']['ep_sparse_r'])
+                            env_infos['ep_shaped_r'].append(info['episode']['ep_shaped_r'])
 
                 self.log_train(train_infos, total_num_steps)
                 self.log_env(env_infos, total_num_steps)
@@ -104,6 +248,58 @@ class OvercookedRunner(Runner):
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
                 self.eval(total_num_steps)
+    
+    def print_channel_min_max(self, obs_grid):
+        H, W, C = obs_grid.shape
+        for ch in range(C):
+            channel_data = obs_grid[:, :, ch]
+            min_val = int(channel_data.min())
+            max_val = int(channel_data.max())
+            
+            # Calculate unique values and their counts
+            unique, counts = np.unique(channel_data, return_counts=True)
+            value_counts = dict(zip(unique, counts))
+            
+            print(f"\nChannel {ch:2d} → Min: {min_val:3d}, Max: {max_val:3d}")
+            for val, count in sorted(value_counts.items()):
+                print(f"Value {val:3d} : {count:6d} times")
+
+    def env_grid(self, obs_grid):
+        H, W, C = obs_grid.shape
+        grid_repr = ""
+
+        symbol_map = {
+            2: "N",   # North (agent 0)
+            3: "S",   # South
+            4: "E",   # East
+            5: "W",   # West
+            6: "n",   # North (agent 1)
+            7: "s",   # South
+            8: "e",   # East
+            9: "w",   # West
+            10: "P",  # Pot location
+            11: "X",  # Wall 
+            12: "O",  # Onion dispencer
+            13: "T",  # Tomato dispencer
+            14: "D",  # Dish dispencer
+            15: "S",  # Serving table
+        }
+
+        for i in range(H):
+            row = ""
+            for j in range(W):
+                active_channels = np.where(obs_grid[i, j, :] == 255)[0]
+                filtered = [ch for ch in active_channels if ch in symbol_map]
+
+                if not filtered:
+                    row += "  " 
+                else:
+                    symbols = ''.join(symbol_map[ch] for ch in filtered)
+                    row += f"{symbols:<2}"
+            grid_repr += row + "\n"
+
+        print(grid_repr)
+
 
     def warmup(self):
         # reset env
@@ -175,7 +371,7 @@ class OvercookedRunner(Runner):
             torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor_periodic_{}.pt".format(step))
             policy_critic = self.trainer.policy.critic
             torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic_periodic_{}.pt".format(step))
-    '''
+    
     @torch.no_grad()
     def eval(self, total_num_steps):
         eval_env_infos = defaultdict(list)
@@ -217,73 +413,6 @@ class OvercookedRunner(Runner):
         
         self.log_env(eval_env_infos, total_num_steps)
     '''
-
-    @torch.no_grad()
-    def eval(self, total_num_steps):
-        import imageio
-        from PIL import Image
-
-        eval_env_infos = defaultdict(list)
-        eval_average_episode_rewards = []
-        frames = []  # 프레임 저장용 리스트
-
-        eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
-        eval_obs = np.stack(eval_obs)
-
-        eval_rnn_states = np.zeros(
-            (self.n_eval_rollout_threads, *self.buffer.rnn_states.shape[2:]), dtype=np.float32
-        )
-        eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
-
-        for eval_step in range(self.episode_length):
-            self.trainer.prep_rollout()
-            eval_action, eval_rnn_states = self.trainer.policy.act(
-                np.concatenate(eval_obs),
-                np.concatenate(eval_rnn_states),
-                np.concatenate(eval_masks),
-                deterministic=not self.all_args.eval_stochastic
-            )
-            eval_actions = np.array(np.split(_t2n(eval_action), self.n_eval_rollout_threads))
-            eval_rnn_states = np.array(np.split(_t2n(eval_rnn_states), self.n_eval_rollout_threads))
-
-            # === 환경 step ===
-            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(eval_actions)
-            eval_obs = np.stack(eval_obs)
-            eval_average_episode_rewards.append(eval_rewards)
-
-            # === 비디오 프레임 저장 ===
-            # 한 환경만 렌더링 (0번 환경)
-            frame = self.eval_envs.render(mode="rgb_array")[0]  # 하나의 rollout thread만 저장
-            frames.append(Image.fromarray(frame))
-
-            # === done 처리 ===
-            eval_rnn_states[eval_dones == True] = np.zeros(
-                ((eval_dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32
-            )
-            eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
-            eval_masks[eval_dones == True] = np.zeros(((eval_dones == True).sum(), 1), dtype=np.float32)
-
-            # === 에피소드 정보 저장 ===
-            for eval_info in eval_infos:
-                eval_env_infos['eval_ep_sparse_r_by_agent0'].append(eval_info['episode']['ep_sparse_r_by_agent'][0])
-                eval_env_infos['eval_ep_sparse_r_by_agent1'].append(eval_info['episode']['ep_sparse_r_by_agent'][1])
-                eval_env_infos['eval_ep_shaped_r_by_agent0'].append(eval_info['episode']['ep_shaped_r_by_agent'][0])
-                eval_env_infos['eval_ep_shaped_r_by_agent1'].append(eval_info['episode']['ep_shaped_r_by_agent'][1])
-                eval_env_infos['eval_ep_sparse_r'].append(eval_info['episode']['ep_sparse_r'])
-                eval_env_infos['eval_ep_shaped_r'].append(eval_info['episode']['ep_shaped_r'])
-
-        eval_env_infos['eval_average_episode_rewards'] = np.sum(eval_average_episode_rewards, axis=0)
-        print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
-
-        # === 비디오 저장 ===
-        video_path = f"eval_episode_{total_num_steps}.mp4"
-        imageio.mimsave(video_path, frames, fps=10)
-        print(f"Saved evaluation video to {video_path}")
-        #wandb.log({f"eval/video_{total_num_steps}": wandb.Video(video_path, fps=10, format="mp4")}, step=total_num_steps)
-        eval_env_infos['eval_video_path'] = video_path
-        # === 로깅 ===
-        self.log_env(eval_env_infos, total_num_steps)
-
     @torch.no_grad()
     def render(self):
         envs = self.envs
@@ -325,6 +454,93 @@ class OvercookedRunner(Runner):
                 ic(info['episode']['ep_shaped_r'])
 
             print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
+    '''
+
+    @torch.no_grad()
+    def render(self):
+        envs = self.envs
+        obs, share_obs, available_actions = envs.reset()
+        obs = np.stack(obs)
+
+        # reset the visit count
+        H, W = obs.shape[3], obs.shape[2]
+        visit_counts = np.zeros((H, W), dtype=np.int32)
+
+        for episode in range(self.all_args.render_episodes):
+            rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
+            masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+            
+            episode_rewards = []
+            trajectory = []
+
+            for step in range(self.episode_length):
+                self.trainer.prep_rollout()
+                action, rnn_states = self.trainer.policy.act(np.concatenate(obs),
+                                                    np.concatenate(rnn_states),
+                                                    np.concatenate(masks),
+                                                    deterministic=not self.all_args.eval_stochastic)
+                actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
+                rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
+
+                obs, share_obs, rewards, dones, infos, available_actions = envs.step(actions)
+                obs = np.stack(obs)
+                episode_rewards.append(rewards)
+    
+                # === Aggregate total visited locations ===
+                for thread_id in range(self.n_rollout_threads):
+                    grid = obs[thread_id, 0, :, :, 0]
+                    y, x = np.where(grid == 255)
+                    if len(y) > 0:
+                        visit_counts[y[0], x[0]] += 1
+
+                rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
+                masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+                masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+
+            for info in infos:
+                ic(info['episode']['ep_sparse_r_by_agent'][0])
+                ic(info['episode']['ep_sparse_r_by_agent'][1])
+                ic(info['episode']['ep_shaped_r_by_agent'][0])
+                ic(info['episode']['ep_shaped_r_by_agent'][1])
+                ic(info['episode']['ep_sparse_r'])
+                ic(info['episode']['ep_shaped_r'])
+
+            print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
+
+        # === Visualizing and saving heatmaps ===
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(visit_counts, cmap="YlGnBu", annot=True, fmt="d")
+        plt.title("Agent Visit Heatmap")
+        plt.xlabel("X (columns)")
+        plt.ylabel("Y (rows)")
+        plt.gca().invert_yaxis()
+        
+        # Save path and file name
+        save_path = "agent_visit_heatmap.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"saved heatmap to {save_path}")
+        
+    def create_ensemble_model(self):
+        dummy_obs_list, dummy_share_obs_list, *_ = self.envs.step(np.zeros((self.n_rollout_threads, 2, 1), dtype=np.int32))
+        dummy_share_obs = np.array(dummy_share_obs_list[0])
+        _, h, w, c = dummy_share_obs.shape
+        feature_dim = h * w * c
+        self.obs_shape = (feature_dim,)
+
+        self.action_dim = self.envs.action_space[0].n
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        ensemble_model = Ensemble(
+            observation_shape=self.obs_shape,
+            action_shape=(self.action_dim,),
+            device=device,
+            hidden_sizes=(256, 256),
+            num_nets=2
+        )
+
+        return ensemble_model
 
     def behavior_cloning(self, training_data):
         from mapbt.algorithms.population.policy_pool import PolicyPool

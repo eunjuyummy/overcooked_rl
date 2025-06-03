@@ -17,5 +17,6 @@ do
     --seed ${seed} --n_training_threads 1 --n_rollout_threads 1 --episode_length 400 \
     --cnn_layers_params "32,3,1,1 64,3,1,1 32,3,1,1" --use_recurrent_policy \
     --use_render --render_episodes 1 --eval_stochastic \
-    --wandb_name "rl-overcooked" --user_name "eunjuyummy"
+    --wandb_name "rl-overcooked" --user_name "eunjuyummy" \
+    --model_dir "model_dir"
 done

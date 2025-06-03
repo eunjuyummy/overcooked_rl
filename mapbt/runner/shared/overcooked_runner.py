@@ -19,6 +19,10 @@ from typing import Dict
 from icecream import ic
 from scipy.stats import rankdata
 
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 def _t2n(x):
     return x.detach().cpu().numpy()
 
@@ -31,7 +35,7 @@ class OvercookedRunner(Runner):
         
         
     def run(self):
-        self.warmup()   
+        self.warmup()
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
@@ -40,11 +44,9 @@ class OvercookedRunner(Runner):
         for episode in range(episodes): 
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
-
-            for step in range(self.episode_length):
+            for step in range(self.episode_length): # episode_length is 400
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
-                    
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
                 obs = np.stack(obs)
@@ -218,7 +220,7 @@ class OvercookedRunner(Runner):
         print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
         
         self.log_env(eval_env_infos, total_num_steps)
-
+    '''
     @torch.no_grad()
     def render(self):
         envs = self.envs
@@ -260,6 +262,72 @@ class OvercookedRunner(Runner):
                 ic(info['episode']['ep_shaped_r'])
 
             print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
+    '''
+    
+    @torch.no_grad()
+    def render(self):
+        envs = self.envs
+        obs, share_obs, available_actions = envs.reset()
+        obs = np.stack(obs)
+
+        # reset the visit count
+        H, W = obs.shape[3], obs.shape[2]
+        visit_counts = np.zeros((H, W), dtype=np.int32)
+
+        for episode in range(self.all_args.render_episodes):
+            rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
+            masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+            
+            episode_rewards = []
+            trajectory = []
+
+            for step in range(self.episode_length):
+                self.trainer.prep_rollout()
+                action, rnn_states = self.trainer.policy.act(np.concatenate(obs),
+                                                    np.concatenate(rnn_states),
+                                                    np.concatenate(masks),
+                                                    deterministic=not self.all_args.eval_stochastic)
+                actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
+                rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
+
+                obs, share_obs, rewards, dones, infos, available_actions = envs.step(actions)
+                obs = np.stack(obs)
+                episode_rewards.append(rewards)
+    
+                # === Aggregate total visited locations ===
+                for thread_id in range(self.n_rollout_threads):
+                    grid = obs[thread_id, 0, :, :, 0]
+                    y, x = np.where(grid == 255)
+                    if len(y) > 0:
+                        visit_counts[y[0], x[0]] += 1
+
+                rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
+                masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+                masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+
+            for info in infos:
+                ic(info['episode']['ep_sparse_r_by_agent'][0])
+                ic(info['episode']['ep_sparse_r_by_agent'][1])
+                ic(info['episode']['ep_shaped_r_by_agent'][0])
+                ic(info['episode']['ep_shaped_r_by_agent'][1])
+                ic(info['episode']['ep_sparse_r'])
+                ic(info['episode']['ep_shaped_r'])
+
+            print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
+
+        # === Visualizing and saving heatmaps ===
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(visit_counts, cmap="YlGnBu", annot=True, fmt="d")
+        plt.title("Agent Visit Heatmap")
+        plt.xlabel("X (columns)")
+        plt.ylabel("Y (rows)")
+        plt.gca().invert_yaxis()
+        
+        # Save path and file name
+        save_path = "agent_visit_heatmap.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"saved heatmap to {save_path}")
 
     def behavior_cloning(self, training_data):
         from mapbt.algorithms.population.policy_pool import PolicyPool
