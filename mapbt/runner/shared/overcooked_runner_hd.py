@@ -48,7 +48,7 @@ class Model(nn.Module):
         return action_mean
     
 class Ensemble(nn.Module):
-    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=2):
+    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=8):
         super(Ensemble, self).__init__()
         
         obs_dim = observation_shape[0]
@@ -89,7 +89,7 @@ class Ensemble(nn.Module):
         torch.save(state, path)
         
 class EnsembleDAgger:
-    def __init__(self, ensemble_model: Ensemble, threshold: float = 0.03):
+    def __init__(self, ensemble_model: Ensemble, threshold: float = 5.0):
         self.ensemble = ensemble_model
         self.threshold = threshold
 
@@ -98,6 +98,10 @@ class EnsembleDAgger:
         var = self.ensemble.variance(obs_np)
         print(var)
         return var > self.threshold
+    def query_expert2(self, obs):
+        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
+        var = self.ensemble.variance(obs_np)
+        return var
 
 class OvercookedRunner(Runner):
     """
@@ -140,7 +144,8 @@ class OvercookedRunner(Runner):
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
                 obs = np.stack(obs)
 
-                if episode > episodes // 2:
+                if episode > 200:
+                    #if True:  
                     primary_agent_idx = 0
                     query_mask = []
 
@@ -148,7 +153,8 @@ class OvercookedRunner(Runner):
                         single_share = share_obs[env_id, primary_agent_idx]
                         obs_for_expert = single_share.reshape(-1)
                         query_mask.append(dagger.query_expert(obs_for_expert))
-                    
+                        var = dagger.query_expert2(obs_for_expert)
+                        print(var)
                     intervened_envs = [env_id for env_id, mask in enumerate(query_mask) if mask][:10]
 
                     for env_id in intervened_envs:
@@ -520,7 +526,7 @@ class OvercookedRunner(Runner):
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"saved heatmap to {save_path}")
-        
+
     def create_ensemble_model(self):
         dummy_obs_list, dummy_share_obs_list, *_ = self.envs.step(np.zeros((self.n_rollout_threads, 2, 1), dtype=np.int32))
         dummy_share_obs = np.array(dummy_share_obs_list[0])
