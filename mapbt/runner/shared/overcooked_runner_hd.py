@@ -48,7 +48,7 @@ class Model(nn.Module):
         return action_mean
     
 class Ensemble(nn.Module):
-    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=8):
+    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=24):
         super(Ensemble, self).__init__()
         
         obs_dim = observation_shape[0]
@@ -119,7 +119,7 @@ class OvercookedRunner(Runner):
         total_num_steps = 0
 
         ensemble_model = self.create_ensemble_model()
-        dagger = EnsembleDAgger(ensemble_model, threshold=10.0)
+        dagger = EnsembleDAgger(ensemble_model, threshold=150.0)
 
         console = Console()
         action_labels = {
@@ -144,22 +144,21 @@ class OvercookedRunner(Runner):
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
                 obs = np.stack(obs)
 
-                if episode > 200:
+                if episode > 80:
                     #if True:  
                     primary_agent_idx = 0
-                    query_mask = []
-
-                    for env_id in range(self.n_rollout_threads):
-                        single_share = share_obs[env_id, primary_agent_idx]
-                        obs_for_expert = single_share.reshape(-1)
-                        query_mask.append(dagger.query_expert(obs_for_expert))
-                        var = dagger.query_expert2(obs_for_expert)
-                        print(var)
-                    intervened_envs = [env_id for env_id, mask in enumerate(query_mask) if mask][:10]
-
-                    for env_id in intervened_envs:
-
-                        console.rule(f"[bold yellow]Episode {episode} – Environment {env_id} State")
+                    #query_mask = []
+                    query = None
+                    
+                    env_id = 0
+                    single_share = share_obs[env_id, primary_agent_idx]
+                    obs_for_expert = single_share.reshape(-1)
+                    query = dagger.query_expert(obs_for_expert)
+                    var = dagger.query_expert2(obs_for_expert)
+                    print(var)
+                    
+                    if query == True:
+                        console.rule(f"[bold yellow]Episode {episode} – Environment {step} Step")
                         single_share = share_obs[env_id, primary_agent_idx]
                         self.env_grid(single_share)
 
@@ -167,7 +166,7 @@ class OvercookedRunner(Runner):
                         valid_actions = [i for i, avail in enumerate(available) if avail == 1]
                         
                         # Show valid actions in a table
-                        table = Table(title=f"Available Actions for Env {env_id}", show_lines=True)
+                        table = Table(title=f"Available Actions", show_lines=True)
                         table.add_column("Index", justify="center", style="cyan")
                         table.add_column("Action", justify="left", style="magenta")
 
@@ -179,7 +178,7 @@ class OvercookedRunner(Runner):
                         # Prompt user for action
                         try:
                             human_action = IntPrompt.ask(
-                                f"[bold green]Select an action for Env {env_id}"
+                                f"[bold green]Select an action "
                             )
                             if human_action in valid_actions:
                                 actions[env_id, 0, 0] = human_action
@@ -194,6 +193,54 @@ class OvercookedRunner(Runner):
                                 )
                         except Exception:
                             console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
+                    
+
+                    # for env_id in range(self.n_rollout_threads):
+                    #     single_share = share_obs[env_id, primary_agent_idx]
+                    #     obs_for_expert = single_share.reshape(-1)
+                    #     query_mask.append(dagger.query_expert(obs_for_expert))
+                    #     query = dagger.query_expert(obs_for_expert)
+                    #     var = dagger.query_expert2(obs_for_expert)
+                    #     print(var)
+                    #intervened_envs = [env_id for env_id, mask in enumerate(query_mask) if mask][:10]
+
+                    # for env_id in intervened_envs:
+
+                    #     console.rule(f"[bold yellow]Episode {episode} – Environment {env_id} State")
+                    #     single_share = share_obs[env_id, primary_agent_idx]
+                    #     self.env_grid(single_share)
+
+                    #     available = available_actions[env_id][0]
+                    #     valid_actions = [i for i, avail in enumerate(available) if avail == 1]
+                        
+                    #     # Show valid actions in a table
+                    #     table = Table(title=f"Available Actions for Env {env_id}", show_lines=True)
+                    #     table.add_column("Index", justify="center", style="cyan")
+                    #     table.add_column("Action", justify="left", style="magenta")
+
+                    #     for action in valid_actions:
+                    #         label = action_labels.get(action, "Unknown")
+                    #         table.add_row(str(action), label)
+                    #     console.print(table)
+
+                    #     # Prompt user for action
+                    #     try:
+                    #         human_action = IntPrompt.ask(
+                    #             f"[bold green]Select an action for Env {env_id}"
+                    #         )
+                    #         if human_action in valid_actions:
+                    #             actions[env_id, 0, 0] = human_action
+                    #             console.print(
+                    #                 f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})",
+                    #                 style="bold green"
+                    #             )
+                    #         else:
+                    #             console.print(
+                    #                 f"[red]✘ Error: {human_action} is not in {valid_actions}",
+                    #                 style="bold red"
+                    #             )
+                    #     except Exception:
+                    #         console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
 
                 total_num_steps += (self.n_rollout_threads)
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
