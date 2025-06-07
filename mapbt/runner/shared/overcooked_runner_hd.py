@@ -19,6 +19,8 @@ from collections import defaultdict, deque
 from typing import Dict
 from icecream import ic
 from scipy.stats import rankdata
+from mapbt.runner.shared.ensemble_models import Ensemble, EnsembleDAgger
+from mapbt.runner.shared.dagger_utils import train_model
 
 from rich.console import Console
 from rich.table import Table
@@ -27,88 +29,21 @@ from rich.prompt import IntPrompt
 def _t2n(x):
     return x.detach().cpu().numpy()
 
-class Model(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size):
-        super(Model, self).__init__()
-        self.activation = torch.relu
-        self.affine_layers = nn.ModuleList()
-        last_dim = state_dim
-        for nh in hidden_size:
-            layer = nn.Linear(last_dim, nh)
-            nn.init.xavier_uniform_(layer.weight)
-            self.affine_layers.append(layer)
-            last_dim = nh
-
-        self.action_mean = nn.Linear(last_dim, action_dim)
-
-    def forward(self, x):
-        for affine in self.affine_layers:
-            x = self.activation(affine(x))
-        action_mean = self.action_mean(x)
-        return action_mean
-    
-class Ensemble(nn.Module):
-    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=24):
-        super(Ensemble, self).__init__()
-        
-        obs_dim = observation_shape[0]
-        act_dim = action_shape[0]
-        self.device = device
-        self.num_nets = num_nets
-
-        self.pis = []
-        for _ in range(num_nets):
-            pi = Model(obs_dim, act_dim, hidden_sizes).to(device).float()
-            self.pis.append(pi)
-
-    def act(self, obs, i=-1):
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            if i >= 0:  # optionally, only use one of the nets.
-                return self.pis[i](obs).cpu().numpy()
-            vals = list()
-            for pi in self.pis:
-                vals.append(pi(obs).cpu().numpy())
-            return np.mean(np.array(vals), axis=0)
-
-    def variance(self, obs):
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            vals = list()
-            for pi in self.pis:
-                vals.append(pi(obs).cpu().numpy())
-            return np.square(np.std(np.array(vals), axis=0)).mean()
-
-    def load(self, path):
-        state = torch.load(path)
-        for net_id, net_state in state.items():
-            self.pis[int(net_id[-1])].load_state_dict(net_state)
-
-    def save(self, path):
-        state = {"ensemble_net_{}".format(i): self.pis[i].state_dict() for i in range(len(self.pis))}
-        torch.save(state, path)
-        
-class EnsembleDAgger:
-    def __init__(self, ensemble_model: Ensemble, threshold: float = 5.0):
-        self.ensemble = ensemble_model
-        self.threshold = threshold
-
-    def query_expert(self, obs):
-        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
-        var = self.ensemble.variance(obs_np)
-        print(var)
-        return var > self.threshold
-    def query_expert2(self, obs):
-        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
-        var = self.ensemble.variance(obs_np)
-        return var
-
 class OvercookedRunner(Runner):
     """
     A wrapper to start the RL agent training algorithm.
     """
     def __init__(self, config):
         super(OvercookedRunner, self).__init__(config)
+        self.bc_data_path = "/app/mapbt/runner/shared/human_data/17_24_51_ppo_bc.json"
+        self.bc_data_usage = 30000
+        self.num_iters = 5
+        self.steps_per_iter = 5000
+        self.learning_rate = 5e-4
+        self.batch_size = 256
+        self.num_sgd_epoch = 1000
+        self.need_eval = True
+        self.eval_episodes = 30
         
         
     def run(self):
@@ -117,9 +52,10 @@ class OvercookedRunner(Runner):
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
         total_num_steps = 0
-
+        
+        print("network 학습을 수행합니다.")
+        
         ensemble_model = self.create_ensemble_model()
-        dagger = EnsembleDAgger(ensemble_model, threshold=150.0)
 
         console = Console()
         action_labels = {
@@ -142,9 +78,17 @@ class OvercookedRunner(Runner):
                     
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+                
+                obs = np.stack(obs)
+                share_obs = np.stack(share_obs)
+                actions = np.array(actions)
+                
+                train_model = self.train_ensemble(share_obs, actions, ensemble_model)
+                dagger = EnsembleDAgger(train_model, threshold=150.0)
+                
                 obs = np.stack(obs)
 
-                if episode > 80:
+                if True:
                     #if True:  
                     primary_agent_idx = 0
                     #query_mask = []
@@ -301,6 +245,40 @@ class OvercookedRunner(Runner):
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
                 self.eval(total_num_steps)
+                
+    def train_ensemble(self, share_obs: np.ndarray, actions: np.ndarray, ensemble):
+        n_envs, n_agents, H, W, C = share_obs.shape
+        feature_dim = H * W * C
+
+        # flatten
+        flat_states = share_obs.reshape(n_envs, n_agents, feature_dim)
+        flat_actions = actions.reshape(n_envs, n_agents)
+        primary = 0
+
+        X_train = [ flat_states[i, primary] for i in range(n_envs) ]
+        # action_dim 차원 one-hot 벡터로
+        action_dim = self.action_dim
+        y_train = [
+            np.eye(action_dim, dtype=np.float32)[ int(flat_actions[i, primary]) ]
+            for i in range(n_envs)
+        ]
+
+        # 2) ensemble 생성 & 학습
+        bc_dir = os.path.join(self.save_dir, "ensemble_bc")
+        os.makedirs(bc_dir, exist_ok=True)
+
+        train_model(
+            model=ensemble,
+            X_train=X_train,
+            y_train=y_train,
+            save_path=os.path.join(bc_dir, "model_iter_0.pth"),
+            num_epochs=5,
+            learning_rate=1e-4,
+            batch_size=self.batch_size,
+            exp_log=None
+        )
+
+        return ensemble
     
     def print_channel_min_max(self, obs_grid):
         H, W, C = obs_grid.shape
@@ -590,7 +568,7 @@ class OvercookedRunner(Runner):
             action_shape=(self.action_dim,),
             device=device,
             hidden_sizes=(256, 256),
-            num_nets=2
+            num_nets=8
         )
 
         return ensemble_model

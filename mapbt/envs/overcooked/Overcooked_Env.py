@@ -829,6 +829,8 @@ class Overcooked:
                 stuck_info.append([False, []])
 
         info["stuck"] = stuck_info
+        
+        info["state"] = self.base_env.state
 
         # can_begin_cook_soup
         can_begin_cook_info = [self.mdp._shaped_info_can_begin_cook_soup(next_state, agent_id) for agent_id in range(self.num_agents)]
