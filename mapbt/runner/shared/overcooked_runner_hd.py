@@ -440,7 +440,7 @@ class OvercookedRunner(Runner):
             's': 2,       # down
             'a': 3,       # left
             'd': 4,       # right
-            'space': 5    # spacebar
+            'q': 5    # spacebar
         }
 
         while True:
