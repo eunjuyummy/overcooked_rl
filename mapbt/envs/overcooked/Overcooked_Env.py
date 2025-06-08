@@ -206,7 +206,7 @@ class OvercookedEnv(object):
 
         # Update game_stats 
         self._update_game_stats(mdp_infos)
-
+        current_state = self.state
         # Update state and done
         self.state = next_state
         done = self.is_done()
@@ -215,6 +215,7 @@ class OvercookedEnv(object):
         if done: self._add_episode_info(env_info)
 
         timestep_sparse_reward = sum(mdp_infos["sparse_reward_by_agent"])
+
         return next_state, timestep_sparse_reward, done, env_info
 
     def lossless_state_encoding_mdp(self, state):
@@ -829,7 +830,9 @@ class Overcooked:
                 stuck_info.append([False, []])
 
         info["stuck"] = stuck_info
-
+        info["state"] = self.base_env.state
+        info["mdp"] = self.base_mdp.mdp_params
+        
         # can_begin_cook_soup
         can_begin_cook_info = [self.mdp._shaped_info_can_begin_cook_soup(next_state, agent_id) for agent_id in range(self.num_agents)]
         info["can_begin_cook"] = can_begin_cook_info
@@ -959,6 +962,6 @@ class Overcooked:
             os.makedirs(f'{self.run_dir}/trajs/{self.layout_name}/')
         save_dir = f'{self.run_dir}/trajs/{self.layout_name}/traj_{self.rank}_{self.traj_num}.pkl'
         pickle.dump(self.traj_to_store, open(save_dir, 'wb'))
-
+        
     def close(self):
         pass

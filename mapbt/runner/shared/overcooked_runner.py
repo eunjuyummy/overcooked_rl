@@ -220,49 +220,6 @@ class OvercookedRunner(Runner):
         print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
         
         self.log_env(eval_env_infos, total_num_steps)
-    '''
-    @torch.no_grad()
-    def render(self):
-        envs = self.envs
-        obs, share_obs, available_actions = envs.reset()
-        obs = np.stack(obs)
-
-        for episode in range(self.all_args.render_episodes):
-            rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
-            masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-            
-            episode_rewards = []
-            trajectory = []
-            for step in range(self.episode_length):
-                calc_start = time.time()
-
-                self.trainer.prep_rollout()
-                action, rnn_states = self.trainer.policy.act(np.concatenate(obs),
-                                                    np.concatenate(rnn_states),
-                                                    np.concatenate(masks),
-                                                    deterministic=not self.all_args.eval_stochastic)
-                actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
-                rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
-                # Obser reward and next obs
-                obs, share_obs, rewards, dones, infos, available_actions = envs.step(actions)
-                obs = np.stack(obs)
-
-                episode_rewards.append(rewards)
-
-                rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
-                masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-                masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
-
-            for info in infos:
-                ic(info['episode']['ep_sparse_r_by_agent'][0])
-                ic(info['episode']['ep_sparse_r_by_agent'][1])
-                ic(info['episode']['ep_shaped_r_by_agent'][0])
-                ic(info['episode']['ep_shaped_r_by_agent'][1])
-                ic(info['episode']['ep_sparse_r'])
-                ic(info['episode']['ep_shaped_r'])
-
-            print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
-    '''
     
     @torch.no_grad()
     def render(self):
@@ -271,7 +228,7 @@ class OvercookedRunner(Runner):
         obs = np.stack(obs)
 
         # reset the visit count
-        H, W = obs.shape[3], obs.shape[2]
+        H, W = H, W = obs.shape[2], obs.shape[3]
         visit_counts = np.zeros((H, W), dtype=np.int32)
 
         for episode in range(self.all_args.render_episodes):
@@ -317,14 +274,15 @@ class OvercookedRunner(Runner):
 
         # === Visualizing and saving heatmaps ===
         plt.figure(figsize=(6, 5))
-        sns.heatmap(visit_counts, cmap="YlGnBu", annot=True, fmt="d")
+        rotated_counts = np.rot90(visit_counts, k=1)
+        sns.heatmap(rotated_counts, cmap="YlGnBu", annot=True, fmt="d")
         plt.title("Agent Visit Heatmap")
         plt.xlabel("X (columns)")
         plt.ylabel("Y (rows)")
         plt.gca().invert_yaxis()
         
         # Save path and file name
-        save_path = "agent_visit_heatmap.png"
+        save_path = "agent_visit_heatmap_sp.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"saved heatmap to {save_path}")

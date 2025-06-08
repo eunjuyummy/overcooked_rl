@@ -20,88 +20,18 @@ from typing import Dict
 from icecream import ic
 from scipy.stats import rankdata
 
+from mapbt.runner.shared.ensemble_models import Ensemble, EnsembleDAgger
+from mapbt.runner.shared.dagger_utils import train_model
+
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import IntPrompt
 
+from overcooked_ai_py.visualization.state_visualizer import StateVisualizer
+import pygame
+
 def _t2n(x):
     return x.detach().cpu().numpy()
-
-class Model(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size):
-        super(Model, self).__init__()
-        self.activation = torch.relu
-        self.affine_layers = nn.ModuleList()
-        last_dim = state_dim
-        for nh in hidden_size:
-            layer = nn.Linear(last_dim, nh)
-            nn.init.xavier_uniform_(layer.weight)
-            self.affine_layers.append(layer)
-            last_dim = nh
-
-        self.action_mean = nn.Linear(last_dim, action_dim)
-
-    def forward(self, x):
-        for affine in self.affine_layers:
-            x = self.activation(affine(x))
-        action_mean = self.action_mean(x)
-        return action_mean
-    
-class Ensemble(nn.Module):
-    def __init__(self, observation_shape, action_shape, device, hidden_sizes=(256, 256), num_nets=24):
-        super(Ensemble, self).__init__()
-        
-        obs_dim = observation_shape[0]
-        act_dim = action_shape[0]
-        self.device = device
-        self.num_nets = num_nets
-
-        self.pis = []
-        for _ in range(num_nets):
-            pi = Model(obs_dim, act_dim, hidden_sizes).to(device).float()
-            self.pis.append(pi)
-
-    def act(self, obs, i=-1):
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            if i >= 0:  # optionally, only use one of the nets.
-                return self.pis[i](obs).cpu().numpy()
-            vals = list()
-            for pi in self.pis:
-                vals.append(pi(obs).cpu().numpy())
-            return np.mean(np.array(vals), axis=0)
-
-    def variance(self, obs):
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            vals = list()
-            for pi in self.pis:
-                vals.append(pi(obs).cpu().numpy())
-            return np.square(np.std(np.array(vals), axis=0)).mean()
-
-    def load(self, path):
-        state = torch.load(path)
-        for net_id, net_state in state.items():
-            self.pis[int(net_id[-1])].load_state_dict(net_state)
-
-    def save(self, path):
-        state = {"ensemble_net_{}".format(i): self.pis[i].state_dict() for i in range(len(self.pis))}
-        torch.save(state, path)
-        
-class EnsembleDAgger:
-    def __init__(self, ensemble_model: Ensemble, threshold: float = 5.0):
-        self.ensemble = ensemble_model
-        self.threshold = threshold
-
-    def query_expert(self, obs):
-        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
-        var = self.ensemble.variance(obs_np)
-        print(var)
-        return var > self.threshold
-    def query_expert2(self, obs):
-        obs_np = obs if isinstance(obs, np.ndarray) else np.array(obs)
-        var = self.ensemble.variance(obs_np)
-        return var
 
 class OvercookedRunner(Runner):
     """
@@ -109,17 +39,19 @@ class OvercookedRunner(Runner):
     """
     def __init__(self, config):
         super(OvercookedRunner, self).__init__(config)
-        
-        
+        self.visualizer = StateVisualizer()
+        self.num_iters = 10
+        self.learning_rate = 1e-4 
+        self.batch_size = 512
+
     def run(self):
-        self.warmup()   
+        self.warmup()
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
         total_num_steps = 0
 
         ensemble_model = self.create_ensemble_model()
-        dagger = EnsembleDAgger(ensemble_model, threshold=150.0)
 
         console = Console()
         action_labels = {
@@ -134,7 +66,7 @@ class OvercookedRunner(Runner):
         for episode in range(episodes): 
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
-
+            
             for step in range(self.episode_length):
                 
                 # Sample actions
@@ -143,105 +75,36 @@ class OvercookedRunner(Runner):
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
                 obs = np.stack(obs)
+                share_obs = np.stack(share_obs)
+                actions = np.array(actions)
 
-                if episode > 80:
-                    #if True:  
-                    primary_agent_idx = 0
-                    #query_mask = []
-                    query = None
+                if episode < 80 and episode % 10 == 0:
                     
                     env_id = 0
+                    primary_agent_idx = 0
+
+                    train_model = self.train_ensemble(share_obs, actions, ensemble_model)
+                    dagger = EnsembleDAgger(train_model, threshold=300.0) # threshold
+
                     single_share = share_obs[env_id, primary_agent_idx]
-                    obs_for_expert = single_share.reshape(-1)
-                    query = dagger.query_expert(obs_for_expert)
-                    var = dagger.query_expert2(obs_for_expert)
-                    print(var)
-                    
-                    if query == True:
-                        console.rule(f"[bold yellow]Episode {episode} – Environment {step} Step")
-                        single_share = share_obs[env_id, primary_agent_idx]
-                        self.env_grid(single_share)
+                    single_share_obs = single_share.reshape(-1)
+                    query = dagger.query_expert(single_share_obs)
 
-                        available = available_actions[env_id][0]
-                        valid_actions = [i for i, avail in enumerate(available) if avail == 1]
+                    if query:
+                        var = dagger.query_expert2(single_share_obs)
+                        console.print(f"[bold green]Variance {var:.1f}")
+                        render_data = {
+                            "state": infos[0]["state"],  
+                            "grid": infos[0]["mdp"]["terrain"]
+                        }
+
+                        console.print(f"[bold yellow]Episode {episode} – Environment {step} Step")
+                        human_action = self.human_control_loop(render_data["state"], render_data["grid"])
+                        actions[env_id, 0, 0] = human_action
+                        console.print(
+                            f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})"
+                        )
                         
-                        # Show valid actions in a table
-                        table = Table(title=f"Available Actions", show_lines=True)
-                        table.add_column("Index", justify="center", style="cyan")
-                        table.add_column("Action", justify="left", style="magenta")
-
-                        for action in valid_actions:
-                            label = action_labels.get(action, "Unknown")
-                            table.add_row(str(action), label)
-                        console.print(table)
-
-                        # Prompt user for action
-                        try:
-                            human_action = IntPrompt.ask(
-                                f"[bold green]Select an action "
-                            )
-                            if human_action in valid_actions:
-                                actions[env_id, 0, 0] = human_action
-                                console.print(
-                                    f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})",
-                                    style="bold green"
-                                )
-                            else:
-                                console.print(
-                                    f"[red]✘ Error: {human_action} is not in {valid_actions}",
-                                    style="bold red"
-                                )
-                        except Exception:
-                            console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
-                    
-
-                    # for env_id in range(self.n_rollout_threads):
-                    #     single_share = share_obs[env_id, primary_agent_idx]
-                    #     obs_for_expert = single_share.reshape(-1)
-                    #     query_mask.append(dagger.query_expert(obs_for_expert))
-                    #     query = dagger.query_expert(obs_for_expert)
-                    #     var = dagger.query_expert2(obs_for_expert)
-                    #     print(var)
-                    #intervened_envs = [env_id for env_id, mask in enumerate(query_mask) if mask][:10]
-
-                    # for env_id in intervened_envs:
-
-                    #     console.rule(f"[bold yellow]Episode {episode} – Environment {env_id} State")
-                    #     single_share = share_obs[env_id, primary_agent_idx]
-                    #     self.env_grid(single_share)
-
-                    #     available = available_actions[env_id][0]
-                    #     valid_actions = [i for i, avail in enumerate(available) if avail == 1]
-                        
-                    #     # Show valid actions in a table
-                    #     table = Table(title=f"Available Actions for Env {env_id}", show_lines=True)
-                    #     table.add_column("Index", justify="center", style="cyan")
-                    #     table.add_column("Action", justify="left", style="magenta")
-
-                    #     for action in valid_actions:
-                    #         label = action_labels.get(action, "Unknown")
-                    #         table.add_row(str(action), label)
-                    #     console.print(table)
-
-                    #     # Prompt user for action
-                    #     try:
-                    #         human_action = IntPrompt.ask(
-                    #             f"[bold green]Select an action for Env {env_id}"
-                    #         )
-                    #         if human_action in valid_actions:
-                    #             actions[env_id, 0, 0] = human_action
-                    #             console.print(
-                    #                 f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})",
-                    #                 style="bold green"
-                    #             )
-                    #         else:
-                    #             console.print(
-                    #                 f"[red]✘ Error: {human_action} is not in {valid_actions}",
-                    #                 style="bold red"
-                    #             )
-                    #     except Exception:
-                    #         console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
-
                 total_num_steps += (self.n_rollout_threads)
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
                 data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
@@ -302,57 +165,39 @@ class OvercookedRunner(Runner):
             if episode % self.eval_interval == 0 and self.use_eval:
                 self.eval(total_num_steps)
     
-    def print_channel_min_max(self, obs_grid):
-        H, W, C = obs_grid.shape
-        for ch in range(C):
-            channel_data = obs_grid[:, :, ch]
-            min_val = int(channel_data.min())
-            max_val = int(channel_data.max())
-            
-            # Calculate unique values and their counts
-            unique, counts = np.unique(channel_data, return_counts=True)
-            value_counts = dict(zip(unique, counts))
-            
-            print(f"\nChannel {ch:2d} → Min: {min_val:3d}, Max: {max_val:3d}")
-            for val, count in sorted(value_counts.items()):
-                print(f"Value {val:3d} : {count:6d} times")
+    def train_ensemble(self, share_obs: np.ndarray, actions: np.ndarray, ensemble):
+        n_envs, n_agents, H, W, C = share_obs.shape
+        feature_dim = H * W * C
 
-    def env_grid(self, obs_grid):
-        H, W, C = obs_grid.shape
-        grid_repr = ""
+        # flatten
+        flat_states = share_obs.reshape(n_envs, n_agents, feature_dim)
+        flat_actions = actions.reshape(n_envs, n_agents)
+        primary = 0
 
-        symbol_map = {
-            2: "N",   # North (agent 0)
-            3: "S",   # South
-            4: "E",   # East
-            5: "W",   # West
-            6: "n",   # North (agent 1)
-            7: "s",   # South
-            8: "e",   # East
-            9: "w",   # West
-            10: "P",  # Pot location
-            11: "X",  # Wall 
-            12: "O",  # Onion dispencer
-            13: "T",  # Tomato dispencer
-            14: "D",  # Dish dispencer
-            15: "S",  # Serving table
-        }
+        X_train = [ flat_states[i, primary] for i in range(n_envs) ]
+        # convert to a one-hot vector with dimension equal to action_dim
+        action_dim = self.action_dim
+        y_train = [
+            np.eye(action_dim, dtype=np.float32)[ int(flat_actions[i, primary]) ]
+            for i in range(n_envs)
+        ]
 
-        for i in range(H):
-            row = ""
-            for j in range(W):
-                active_channels = np.where(obs_grid[i, j, :] == 255)[0]
-                filtered = [ch for ch in active_channels if ch in symbol_map]
+        # 2) create and train the ensemble
+        bc_dir = os.path.join(self.save_dir, "ensemble")
+        os.makedirs(bc_dir, exist_ok=True)
 
-                if not filtered:
-                    row += "  " 
-                else:
-                    symbols = ''.join(symbol_map[ch] for ch in filtered)
-                    row += f"{symbols:<2}"
-            grid_repr += row + "\n"
+        train_model(
+            model=ensemble,
+            X_train=X_train,
+            y_train=y_train,
+            save_path=os.path.join(bc_dir, "model_iter_0.pth"),
+            num_epochs=self.num_iters,
+            learning_rate=self.learning_rate,
+            batch_size=self.batch_size,
+            exp_log=None
+        )
 
-        print(grid_repr)
-
+        return ensemble
 
     def warmup(self):
         # reset env
@@ -465,49 +310,6 @@ class OvercookedRunner(Runner):
         print("eval average sparse rewards: " + str(np.mean(eval_env_infos['eval_ep_sparse_r'])))
         
         self.log_env(eval_env_infos, total_num_steps)
-    '''
-    @torch.no_grad()
-    def render(self):
-        envs = self.envs
-        obs, share_obs, available_actions = envs.reset()
-        obs = np.stack(obs)
-
-        for episode in range(self.all_args.render_episodes):
-            rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
-            masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-            
-            episode_rewards = []
-            trajectory = []
-            for step in range(self.episode_length):
-                calc_start = time.time()
-
-                self.trainer.prep_rollout()
-                action, rnn_states = self.trainer.policy.act(np.concatenate(obs),
-                                                    np.concatenate(rnn_states),
-                                                    np.concatenate(masks),
-                                                    deterministic=not self.all_args.eval_stochastic)
-                actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
-                rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
-                # Obser reward and next obs
-                obs, share_obs, rewards, dones, infos, available_actions = envs.step(actions)
-                obs = np.stack(obs)
-
-                episode_rewards.append(rewards)
-
-                rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
-                masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-                masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
-
-            for info in infos:
-                ic(info['episode']['ep_sparse_r_by_agent'][0])
-                ic(info['episode']['ep_sparse_r_by_agent'][1])
-                ic(info['episode']['ep_shaped_r_by_agent'][0])
-                ic(info['episode']['ep_shaped_r_by_agent'][1])
-                ic(info['episode']['ep_sparse_r'])
-                ic(info['episode']['ep_shaped_r'])
-
-            print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
-    '''
 
     @torch.no_grad()
     def render(self):
@@ -516,7 +318,7 @@ class OvercookedRunner(Runner):
         obs = np.stack(obs)
 
         # reset the visit count
-        H, W = obs.shape[3], obs.shape[2]
+        H, W = H, W = obs.shape[2], obs.shape[3]
         visit_counts = np.zeros((H, W), dtype=np.int32)
 
         for episode in range(self.all_args.render_episodes):
@@ -562,14 +364,15 @@ class OvercookedRunner(Runner):
 
         # === Visualizing and saving heatmaps ===
         plt.figure(figsize=(6, 5))
-        sns.heatmap(visit_counts, cmap="YlGnBu", annot=True, fmt="d")
+        rotated_counts = np.rot90(visit_counts, k=1)
+        sns.heatmap(rotated_counts, cmap="YlGnBu", annot=True, fmt="d")
         plt.title("Agent Visit Heatmap")
         plt.xlabel("X (columns)")
         plt.ylabel("Y (rows)")
         plt.gca().invert_yaxis()
         
         # Save path and file name
-        save_path = "agent_visit_heatmap.png"
+        save_path = "agent_visit_heatmap_sp_hg.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"saved heatmap to {save_path}")
@@ -590,10 +393,42 @@ class OvercookedRunner(Runner):
             action_shape=(self.action_dim,),
             device=device,
             hidden_sizes=(256, 256),
-            num_nets=2
+            num_nets=8
         )
 
         return ensemble_model
+
+    def human_control_loop(self, state, grid):
+
+        pygame.init()
+        surface = self.visualizer.render_state(state, grid)
+        screen = pygame.display.set_mode(surface.get_size())
+        pygame.display.set_caption("Human Control Mode")
+        screen.blit(surface, (0, 0))
+        pygame.display.flip()
+
+        action = None
+        action_map = {
+            pygame.K_UP: 1,  
+            pygame.K_DOWN: 2,    
+            pygame.K_LEFT: 3, 
+            pygame.K_RIGHT: 4, 
+            pygame.K_SPACE: 5 
+        }
+
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit("The user has closed the window.")
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in action_map:
+                        action = action_map[event.key]
+                        running = False
+
+        pygame.quit()
+        return action
 
     def behavior_cloning(self, training_data):
         from mapbt.algorithms.population.policy_pool import PolicyPool
