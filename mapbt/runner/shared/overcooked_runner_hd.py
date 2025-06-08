@@ -99,7 +99,7 @@ class OvercookedRunner(Runner):
                         }
 
                         console.print(f"[bold yellow]Episode {episode} – Environment {step} Step")
-                        human_action = self.human_control_loop(render_data["state"], render_data["grid"])
+                        human_action = self.human_control_loop(episode, step, render_data["state"], render_data["grid"])
                         actions[env_id, 0, 0] = human_action
                         console.print(
                             f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})"
@@ -398,15 +398,21 @@ class OvercookedRunner(Runner):
 
         return ensemble_model
 
-    def human_control_loop(self, state, grid):
+    def human_control_loop(self, episode, step, state, grid):
 
         pygame.init()
         surface = self.visualizer.render_state(state, grid)
-        screen = pygame.display.set_mode(surface.get_size())
-        pygame.display.set_caption("Human Control Mode")
-        screen.blit(surface, (0, 0))
-        pygame.display.flip()
+        #screen = pygame.display.set_mode(surface.get_size())
+        #pygame.display.set_caption("Human Control Mode")
+        #screen.blit(surface, (0, 0))
+        #pygame.display.flip()
 
+
+        os.makedirs("rendered_frames", exist_ok=True)
+        image_path = f"rendered_frames/episode_{episode}_step_{step}.png"
+        pygame.image.save(surface, image_path)
+
+        '''
         action = None
         action_map = {
             pygame.K_UP: 1,  
@@ -426,9 +432,23 @@ class OvercookedRunner(Runner):
                     if event.key in action_map:
                         action = action_map[event.key]
                         running = False
-
+        '''
         pygame.quit()
-        return action
+
+        action_map = {
+            'w': 1,       # up
+            's': 2,       # down
+            'a': 3,       # left
+            'd': 4,       # right
+            'space': 5    # spacebar
+        }
+
+        while True:
+            key = input("Press a key (w/a/s/d/space): ").strip().lower()
+            if key in action_map:
+                return action_map[key]
+            else:
+                print("Invalid input. Use w/a/s/d/space.")
 
     def behavior_cloning(self, training_data):
         from mapbt.algorithms.population.policy_pool import PolicyPool
