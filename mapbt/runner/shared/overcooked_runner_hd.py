@@ -84,7 +84,7 @@ class OvercookedRunner(Runner):
                     primary_agent_idx = 0
 
                     train_model = self.train_ensemble(share_obs, actions, ensemble_model)
-                    dagger = EnsembleDAgger(ensemble_model, threshold=280.0) # threshold
+                    dagger = EnsembleDAgger(ensemble_model, threshold=200) # threshold
 
                     single_share = share_obs[env_id, primary_agent_idx]
                     single_share_obs = single_share.reshape(-1)
