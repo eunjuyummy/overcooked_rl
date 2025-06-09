@@ -26,7 +26,7 @@ from mapbt.runner.shared.dagger_utils import train_model
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import IntPrompt
-
+import random
 from overcooked_ai_py.visualization.state_visualizer import StateVisualizer
 import pygame
 
@@ -40,7 +40,7 @@ class OvercookedRunner(Runner):
     def __init__(self, config):
         super(OvercookedRunner, self).__init__(config)
         self.visualizer = StateVisualizer()
-        self.num_iters = 10
+        self.num_iters = 5
         self.learning_rate = 1e-4 
         self.batch_size = 512
 
@@ -66,7 +66,7 @@ class OvercookedRunner(Runner):
         for episode in range(episodes): 
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
-            
+            #intervention_steps = set(random.sample(range(self.episode_length), 50))
             for step in range(self.episode_length):
                 
                 # Sample actions
@@ -84,27 +84,46 @@ class OvercookedRunner(Runner):
                     primary_agent_idx = 0
 
                     train_model = self.train_ensemble(share_obs, actions, ensemble_model)
-                    dagger = EnsembleDAgger(train_model, threshold=300.0) # threshold
+                    dagger = EnsembleDAgger(ensemble_model, threshold=280.0) # threshold
 
                     single_share = share_obs[env_id, primary_agent_idx]
                     single_share_obs = single_share.reshape(-1)
                     query = dagger.query_expert(single_share_obs)
 
                     if query:
-                        var = dagger.query_expert2(single_share_obs)
-                        console.print(f"[bold green]Variance {var:.1f}")
-                        render_data = {
-                            "state": infos[0]["state"],  
-                            "grid": infos[0]["mdp"]["terrain"]
-                        }
 
-                        console.print(f"[bold yellow]Episode {episode} – Environment {step} Step")
-                        human_action = self.human_control_loop(episode, step, render_data["state"], render_data["grid"])
-                        actions[env_id, 0, 0] = human_action
-                        console.print(
-                            f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})"
-                        )
+                        single_share = share_obs[env_id, primary_agent_idx]
+                        self.env_grid(single_share)
+                        available = available_actions[env_id][0]
+                        valid_actions = [i for i, avail in enumerate(available) if avail == 1]
+
+                        table = Table(title=f"Available Actions", show_lines=True)
+                        table.add_column("Index", justify="center", style="cyan")
+                        table.add_column("Action", justify="left", style="magenta")
+                        for action in valid_actions:
+                            label = action_labels.get(action, "Unknown")
+                            table.add_row(str(action), label)
+                        console.print(table)     
                         
+                        # Prompt user for action
+                        try:
+                            human_action = IntPrompt.ask(
+                                f"[bold green]Select an action "
+                            )
+                            if human_action in valid_actions:
+                                actions[env_id, 0, 0] = human_action
+                                console.print(
+                                    f"[bold cyan]✔ You selected action {human_action} ({action_labels.get(human_action, 'Unknown')})",
+                                    style="bold green"
+                                )
+                            else:
+                                console.print(
+                                    f"[red]✘ Error: {human_action} is not in {valid_actions}",
+                                    style="bold red"
+                                )
+                        except Exception:
+                            console.print("[bold red]✘ Error: Invalid input. Please enter a number.")
+                            
                 total_num_steps += (self.n_rollout_threads)
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
                 data = obs, share_obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
@@ -164,7 +183,7 @@ class OvercookedRunner(Runner):
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
                 self.eval(total_num_steps)
-    
+   
     def train_ensemble(self, share_obs: np.ndarray, actions: np.ndarray, ensemble):
         n_envs, n_agents, H, W, C = share_obs.shape
         feature_dim = H * W * C
@@ -393,26 +412,67 @@ class OvercookedRunner(Runner):
             action_shape=(self.action_dim,),
             device=device,
             hidden_sizes=(256, 256),
-            num_nets=8
+            num_nets=4
         )
 
         return ensemble_model
+        
+    def env_grid(self, obs_grid):
+        H, W, C = obs_grid.shape
+        grid_repr = ""
 
+        symbol_map = {
+            2: "N",   # North (agent 0)
+            3: "S",   # South
+            4: "E",   # East
+            5: "W",   # West
+            6: "n",   # North (agent 1)
+            7: "s",   # South
+            8: "e",   # East
+            9: "w",   # West
+            10: "P",  # Pot
+            11: "X",  # Wall 
+            12: "O",  # Onion
+            13: "T",  # Tomato
+            14: "D",  # Dish
+            15: "S",  # Serving table
+        }
+
+        header = "   " + " ".join(f"{j:2}" for j in range(W)) + "\n"
+        grid_repr += header
+
+        for i in reversed(range(H)):
+            row = f"{i:2} "
+            for j in range(W):
+                active_channels = np.where(obs_grid[i, j, :] == 255)[0]
+                filtered = [ch for ch in active_channels if ch in symbol_map]
+
+                if not filtered:
+                    row += " ."
+                else:
+                    symbols = ''.join(symbol_map[ch] for ch in filtered)
+                    row += f" {symbols[0]}"
+            grid_repr += row + "\n"
+
+        print(grid_repr)
+        
     def human_control_loop(self, episode, step, state, grid):
 
         pygame.init()
-        surface = self.visualizer.render_state(state, grid)
-        #screen = pygame.display.set_mode(surface.get_size())
-        #pygame.display.set_caption("Human Control Mode")
-        #screen.blit(surface, (0, 0))
-        #pygame.display.flip()
+        print("Before render_state")
+        try:
+            surface = self.visualizer.render_state(render_data["state"], render_data["grid"])
+        except Exception as e:
+            print(f"[Error] render_state failed at step {step}: {e}")
+            pass
+        print("After render_state")
 
+        print("Before pygame.display")
+        screen = pygame.display.set_mode(surface.get_size())
+        screen.blit(surface, (0, 0))
+        pygame.display.flip()
+        print("After pygame display")
 
-        os.makedirs("rendered_frames", exist_ok=True)
-        image_path = f"rendered_frames/episode_{episode}_step_{step}.png"
-        pygame.image.save(surface, image_path)
-
-        '''
         action = None
         action_map = {
             pygame.K_UP: 1,  
@@ -432,9 +492,12 @@ class OvercookedRunner(Runner):
                     if event.key in action_map:
                         action = action_map[event.key]
                         running = False
-        '''
+        
         pygame.quit()
-
+        
+        return action
+        
+        '''
         action_map = {
             'w': 1,       # up
             's': 2,       # down
@@ -449,7 +512,7 @@ class OvercookedRunner(Runner):
                 return action_map[key]
             else:
                 print("Invalid input. Use w/a/s/d/space.")
-
+        '''
     def behavior_cloning(self, training_data):
         from mapbt.algorithms.population.policy_pool import PolicyPool
         # set up policy pool for evaluation
